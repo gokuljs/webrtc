@@ -63,7 +63,7 @@ func (t *RTPTransceiver) SetCodecPreferences(codecs []RTPCodecParameters) error 
 		}
 	}
 
-	t.codecs = filterUnattachedRTX(codecs)
+	t.codecs = filterUnattachedRED(filterUnattachedRTX(codecs))
 
 	return nil
 }
@@ -75,7 +75,7 @@ func (t *RTPTransceiver) getCodecs() []RTPCodecParameters {
 
 	mediaEngineCodecs := t.api.mediaEngine.getCodecsByKind(t.kind)
 	if len(t.codecs) == 0 {
-		return filterUnattachedRTX(mediaEngineCodecs)
+		return filterUnattachedRED(filterUnattachedRTX(mediaEngineCodecs))
 	}
 
 	filteredCodecs := []RTPCodecParameters{}
@@ -89,7 +89,7 @@ func (t *RTPTransceiver) getCodecs() []RTPCodecParameters {
 		}
 	}
 
-	return filterUnattachedRTX(filteredCodecs)
+	return filterUnattachedRED(filterUnattachedRTX(filteredCodecs))
 }
 
 // match codecs from remote description, used when remote is offerer and creating a transceiver
@@ -99,9 +99,11 @@ func (t *RTPTransceiver) setCodecPreferencesFromRemoteDescription(media *sdp.Med
 	if err != nil {
 		return
 	}
+	allRemoteCodecs := append([]RTPCodecParameters{}, remoteCodecs...)
 
 	// make a copy as this slice is modified
-	leftCodecs := append([]RTPCodecParameters{}, t.api.mediaEngine.getCodecsByKind(t.kind)...)
+	mediaEngineCodecs := t.api.mediaEngine.getCodecsByKind(t.kind)
+	leftCodecs := append([]RTPCodecParameters{}, mediaEngineCodecs...)
 
 	// find codec matches between what is in remote description and
 	// the transceivers codecs and use payload type registered to
@@ -111,7 +113,8 @@ func (t *RTPTransceiver) setCodecPreferencesFromRemoteDescription(media *sdp.Med
 		filteredCodecs := []RTPCodecParameters{}
 		for remoteCodecIdx := len(remoteCodecs) - 1; remoteCodecIdx >= 0; remoteCodecIdx-- {
 			remoteCodec := remoteCodecs[remoteCodecIdx]
-			if strings.EqualFold(remoteCodec.RTPCodecCapability.MimeType, MimeTypeRTX) {
+			if strings.EqualFold(remoteCodec.RTPCodecCapability.MimeType, MimeTypeRTX) ||
+				strings.EqualFold(remoteCodec.RTPCodecCapability.MimeType, MimeTypeRED) {
 				continue
 			}
 
@@ -158,6 +161,59 @@ func (t *RTPTransceiver) setCodecPreferencesFromRemoteDescription(media *sdp.Med
 
 	filteredCodecs := filterByMatchType(codecMatchExact)
 	filteredCodecs = append(filteredCodecs, filterByMatchType(codecMatchPartial)...)
+
+	// Find RED associations and place RED next to Opus in the order offered by
+	// the remote peer. RED is a dependent format and cannot be matched before
+	// its Opus payload type has been mapped.
+	for remotePayloadType, mediaEnginePayloadType := range payloadMapping {
+		remoteRED := findREDPayloadType(remotePayloadType, allRemoteCodecs)
+		if remoteRED == PayloadType(0) {
+			continue
+		}
+
+		mediaEngineRED := findREDPayloadType(mediaEnginePayloadType, mediaEngineCodecs)
+		if mediaEngineRED == PayloadType(0) {
+			continue
+		}
+
+		var redCodec RTPCodecParameters
+		for _, codec := range mediaEngineCodecs {
+			if codec.PayloadType == mediaEngineRED {
+				redCodec = codec
+
+				break
+			}
+		}
+
+		opusIndex := -1
+		for i, codec := range filteredCodecs {
+			if codec.PayloadType == mediaEnginePayloadType {
+				opusIndex = i
+
+				break
+			}
+		}
+		if opusIndex == -1 {
+			continue
+		}
+
+		remoteREDIndex, remoteOpusIndex := -1, -1
+		for i, codec := range allRemoteCodecs {
+			switch codec.PayloadType {
+			case remoteRED:
+				remoteREDIndex = i
+			case remotePayloadType:
+				remoteOpusIndex = i
+			}
+		}
+		insertIndex := opusIndex + 1
+		if remoteREDIndex < remoteOpusIndex {
+			insertIndex = opusIndex
+		}
+		filteredCodecs = append(filteredCodecs, RTPCodecParameters{})
+		copy(filteredCodecs[insertIndex+1:], filteredCodecs[insertIndex:])
+		filteredCodecs[insertIndex] = redCodec
+	}
 
 	// find RTX associations and add those
 	for remotePayloadType, mediaEnginePayloadType := range payloadMapping {
